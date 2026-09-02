@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Rekognition Liveness demo — identity verification with Amazon Rekognition
+  (Face Liveness + Movement liveness + Face Search + Enroll). Single Lambda
+  dispatcher invoked DIRECTLY from the browser via SigV4. No Cognito, no API
+  Gateway, no CloudFront here — auth and CDN are owned by the WWSO portal
+  stack. This stack owns compute (Lambda), the Rekognition collection (via a
+  setup custom resource), the faces S3 bucket and the movement-challenge table.
+  Disclaimer: strictly for testing and analysis. NOT for production.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Environment suffix for stack outputs and the Lambda function name.
+  CollectionId:
+    Type: String
+    Default: rekognition-liveness-faces
+    Description: Amazon Rekognition collection id backing Search / Enroll.
+  GestureModelId:
+    Type: String
+    Default: in.openai.gpt-5.6-luna
+    Description: >
+      Bedrock model id / inference-profile used by the gesture-liveness verifier
+      (Converse API). Defaults to the bare GPT-5.6 Luna cross-region
+      inference-profile ID, which resolves within the DEPLOYING account (India
+      profile: ap-south-1 / ap-south-2) — no account id hardcoded, so this is
+      portable across accounts. Override with any multimodal model/profile the
+      account has access to (e.g. us.amazon.nova-lite-v1:0) if GPT-5.6 Luna is
+      not enabled or you deploy outside India.
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    MemorySize: 512
+    Architectures: [x86_64]
+    Tags:
+      Project: WWSO
+      Demo: rekognition-liveness
+      Environment: !Ref Environment
+
+Resources:
+  # ----- Faces bucket (stores enrolled photos; the collection keeps only vectors)
+  FacesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'rekognition-liveness-faces-${Environment}-${AWS::Region}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ----- Movement-challenge table (single-use, TTL-expired)
+  ChallengesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: challengeId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: challengeId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ----- Orchestrator Lambda (invoked directly from the browser via SigV4)
+  OrchestratorLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'rekognition-liveness-${Environment}'
+      CodeUri: ../backend/lambda/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          COLLECTION_ID: !Ref CollectionId
+          LIVENESS_THRESHOLD: '75'
+          SIMILARITY_THRESHOLD: '90'
+          CHALLENGES_TABLE: !Ref ChallengesTable
+          FACES_BUCKET: !Ref FacesBucket
+          GESTURE_MODEL_ID: !Ref GestureModelId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChallengesTable
+        - S3CrudPolicy:
+            BucketName: !Ref FacesBucket
+        - Statement:
+            - Sid: RekognitionDataPlane
+              Effect: Allow
+              Action:
+                - rekognition:CreateFaceLivenessSession
+                - rekognition:GetFaceLivenessSessionResults
+                - rekognition:IndexFaces
+                - rekognition:SearchFacesByImage
+                - rekognition:CompareFaces
+                - rekognition:DetectFaces
+                - rekognition:ListFaces
+                - rekognition:DeleteFaces
+              Resource: '*'
+        # Gesture-liveness scenario: validate the captured frame with a
+        # Bedrock multimodal model (GPT-5.6 Luna via cross-region inference
+        # profile). Invoking through an inference profile requires InvokeModel
+        # on BOTH the profile ARN and every foundation-model ARN it routes to
+        # (ap-south-1 + ap-south-2).
+        - Statement:
+            - Sid: BedrockGestureVerify
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource:
+                - 'arn:aws:bedrock:ap-south-1::foundation-model/openai.gpt-5.6-luna'
+                - 'arn:aws:bedrock:ap-south-2::foundation-model/openai.gpt-5.6-luna'
+                - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/in.openai.gpt-5.6-luna'
+
+  # ----- Setup custom resource — creates/deletes the Rekognition collection.
+  # (De-branded from the source: NO Cognito user creation — auth is the portal's.)
+  SetupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SetupPerms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:CreateCollection
+                  - rekognition:DeleteCollection
+                Resource: '*'
+
+  SetupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'rekognition-liveness-setup-${Environment}'
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SetupFunctionRole.Arn
+      InlineCode: |
+        import boto3, json, urllib.request
+
+        def send(event, context, status, data=None, reason=None):
+            body = json.dumps({
+                "Status": status,
+                "Reason": reason or "See CloudWatch Logs",
+                "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                "StackId": event["StackId"],
+                "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"],
+                "Data": data or {},
+            }).encode()
+            req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                         headers={"content-type": "", "content-length": str(len(body))})
+            urllib.request.urlopen(req)
+
+        def handler(event, context):
+            props = event["ResourceProperties"]
+            rek = boto3.client("rekognition")
+            collection = props["CollectionId"]
+            try:
+                if event["RequestType"] in ("Create", "Update"):
+                    try:
+                        rek.create_collection(CollectionId=collection)
+                    except rek.exceptions.ResourceAlreadyExistsException:
+                        pass
+                elif event["RequestType"] == "Delete":
+                    try:
+                        rek.delete_collection(CollectionId=collection)
+                    except Exception:
+                        pass
+                send(event, context, "SUCCESS", {"CollectionId": collection})
+            except Exception as e:
+                send(event, context, "FAILED", reason=str(e))
+
+  Setup:
+    Type: Custom::Setup
+    Properties:
+      ServiceToken: !GetAtt SetupFunction.Arn
+      CollectionId: !Ref CollectionId
+
+  # ===========================================================================
+  # Standalone hosting (no WWSO portal): S3 + CloudFront + guest Identity Pool.
+  # Serves the SPA over HTTPS (required for camera / Face Liveness) and hands
+  # the browser AWS credentials WITHOUT any login, via an unauthenticated
+  # Cognito Identity Pool. WARNING: this makes the orchestrator Lambda,
+  # Rekognition Face Liveness and the Bedrock gesture model publicly invocable
+  # by anyone with the URL. The guest role below is scoped to only those.
+  # ===========================================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'rekognition-liveness-frontend-${Environment}-${AWS::Region}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'rekognition-liveness-${Environment}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'rekognition-liveness standalone frontend (${Environment})'
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # Managed cache policy: CachingOptimized. Deploys invalidate anyway.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          # Private bucket + OAC returns 403 for missing keys; serve index.html
+          # so client-side routes / deep links resolve to the SPA.
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
+  # Unauthenticated Identity Pool — issues guest AWS credentials to the browser.
+  GuestIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub 'rekognition_liveness_${Environment}_guest'
+      AllowUnauthenticatedIdentities: true
+
+  GuestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref GuestIdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: unauthenticated
+      Policies:
+        - PolicyName: GuestLivenessAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeOrchestrator
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt OrchestratorLambda.Arn
+              - Sid: StartLiveness
+                Effect: Allow
+                Action: rekognition:StartFaceLivenessSession
+                Resource: '*'
+
+  GuestIdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref GuestIdentityPool
+      Roles:
+        unauthenticated: !GetAtt GuestRole.Arn
+
+Outputs:
+  CloudFrontUrl:
+    Description: Public HTTPS URL of the standalone liveness frontend.
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution id (for cache invalidations).
+    Value: !Ref FrontendDistribution
+
+  FrontendBucketNameOut:
+    Description: S3 bucket that hosts the built SPA.
+    Value: !Ref FrontendBucket
+
+  GuestIdentityPoolId:
+    Description: Unauthenticated Cognito Identity Pool id for the frontend build (VITE_GUEST_IDENTITY_POOL_ID).
+    Value: !Ref GuestIdentityPool
+
+  LambdaFunctionArn:
+    Description: ARN of the orchestrator Lambda. Imported by the portal stack role.
+    Value: !GetAtt OrchestratorLambda.Arn
+    Export:
+      Name: !Sub 'rekognition-liveness-${Environment}-LambdaArn'
+
+  LambdaFunctionName:
+    Description: Function name for the portal frontend's VITE_LAMBDA_FUNCTION_NAME env var.
+    Value: !Ref OrchestratorLambda
+    Export:
+      Name: !Sub 'rekognition-liveness-${Environment}-LambdaName'
+
+  FacesBucketName:
+    Description: S3 bucket storing enrolled face photos.
+    Value: !Ref FacesBucket
+    Export:
+      Name: !Sub 'rekognition-liveness-${Environment}-FacesBucket'
+
+  CollectionIdOut:
+    Description: Rekognition collection id.
+    Value: !Ref CollectionId
